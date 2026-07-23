@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Editors / OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs / local scratch
+*.log
+.ipynb_checkpoints/
+
+# NOTE: assets/ (mesh + MJCF files) is intentionally NOT ignored - this
+# repo is meant to be self-contained, so the robot assets are tracked.

@@ -1,0 +1,468 @@
+"""
+run_walking.py
+
+Interactive simulation script to execute Unitree G1 standing and walking ONNX policies
+using keyboard teleoperation (via pynput) inside a MuJoCo environment.
+
+Usage Examples:
+---------------
+1. Run with keyboard teleoperation on the default plain table scene (spawns standing at Z=0.74m):
+   python scripts/run_walking.py --scene scenes/mujoco/g1_world_scene.xml --teleop
+
+2. Run in passive mode (robot stands then automatically walks forward at 0.8m/s after 2 seconds):
+   python scripts/run_walking.py --scene scenes/mujoco/g1_world_scene.xml
+
+3. Run in custom scene containing pathway/house geometries with spawn controls:
+   python scripts/run_walking.py --scene path/to/custom_scene.xml --teleop --spawn house
+
+Arguments:
+----------
+  --scene         (str)  : Path to the MuJoCo XML scene file (default: scenes/mujoco/g1_world_scene.xml)
+  --teleop        (flag) : Enable keyboard teleoperation using Arrow keys and Q/E
+  --spawn         (str)  : Spawn preference in custom environments containing pathway/house geoms. 
+                           Choices: 'pathway' or 'house'. Defaults to flat ground level (Z=0.74m) if absent.
+  --stand_policy  (str)  : Path to standing ONNX policy (default: model_policy/stand.onnx)
+  --walk_policy   (str)  : Path to walking ONNX policy (default: model_policy/walk.onnx)
+  --control_freq  (int)  : Policy execution update frequency in Hz (default: 50)
+
+Controls (Teleop mode):
+-----------------------
+  UP Arrow   : Walk Forward (vx +)
+  DOWN Arrow : Walk Backward (vx -)
+  LEFT Arrow : Strafe Left (vy +)
+  RIGHT Arrow: Strafe Right (vy -)
+  Q / E      : Yaw Turn Left / Right (yaw rate)
+  SPACE      : Stop and Stand Still (resets target velocity to 0)
+  ESC / Close: Exit simulation cleanly
+"""
+
+import os
+import sys
+import time
+import argparse
+import collections
+import threading
+import numpy as np
+import mujoco
+import mujoco.viewer
+from pynput import keyboard
+
+# Dynamically add the 'src' directory to Python path
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(os.path.join(repo_root, 'src'))
+
+from g1_control.onnx_policy import ONNXPolicy
+
+# ------------------------------------------------------------------------------
+# MATH & HELPERS
+# ------------------------------------------------------------------------------
+def pd_control(target_q, q, kp, target_dq, dq, kd):
+    return (target_q - q) * kp + (target_dq - dq) * kd
+
+def quat_rotate_inverse(q, v):
+    w, x, y, z = q
+    q_conj = np.array([w, -x, -y, -z])
+    return np.array([
+        v[0] * (q_conj[0] ** 2 + q_conj[1] ** 2 - q_conj[2] ** 2 - q_conj[3] ** 2)
+        + v[1] * 2 * (q_conj[1] * q_conj[2] - q_conj[0] * q_conj[3])
+        + v[2] * 2 * (q_conj[1] * q_conj[3] + q_conj[0] * q_conj[2]),
+        v[0] * 2 * (q_conj[1] * q_conj[2] + q_conj[0] * q_conj[3])
+        + v[1] * (q_conj[0] ** 2 - q_conj[1] ** 2 + q_conj[2] ** 2 - q_conj[3] ** 2)
+        + v[2] * 2 * (q_conj[2] * q_conj[3] - q_conj[0] * q_conj[1]),
+        v[0] * 2 * (q_conj[1] * q_conj[3] - q_conj[0] * q_conj[2])
+        + v[1] * 2 * (q_conj[2] * q_conj[3] + q_conj[0] * q_conj[1])
+        + v[2] * (q_conj[0] ** 2 - q_conj[1] ** 2 - q_conj[2] ** 2 + q_conj[3] ** 2),
+    ], dtype=np.float32)
+
+def get_gravity_orientation(quat):
+    gravity_vec = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+    return quat_rotate_inverse(quat, gravity_vec)
+
+def find_joint_info(model, names):
+    ids, qpos_adrs, dof_adrs = [], [], []
+    for name in names:
+        j_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        if j_id == -1:
+            raise ValueError(f"Joint '{name}' not found in model.")
+        ids.append(j_id)
+        qpos_adrs.append(model.jnt_qposadr[j_id])
+        dof_adrs.append(model.jnt_dofadr[j_id])
+    return ids, qpos_adrs, dof_adrs
+
+# ------------------------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------------------------
+leg_joint_names = [
+    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"
+]
+
+arm_joint_names = [
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+    "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+    "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint"
+]
+
+hand_joint_names = [
+    "left_thumb_metacarpal_joint", "left_thumb_proximal_joint", "left_thumb_distal_joint", "left_thumb_tip_joint",
+    "left_index_proximal_joint", "left_index_distal_joint", "left_index_tip_joint",
+    "left_middle_proximal_joint", "left_middle_distal_joint", "left_middle_tip_joint",
+    "left_ring_proximal_joint", "left_ring_distal_joint", "left_ring_tip_joint",
+    "left_pinky_proximal_joint", "left_pinky_distal_joint", "left_pinky_tip_joint",
+    "right_thumb_metacarpal_joint", "right_thumb_proximal_joint", "right_thumb_distal_joint", "right_thumb_tip_joint",
+    "right_index_proximal_joint", "right_index_distal_joint", "right_index_tip_joint",
+    "right_middle_proximal_joint", "right_middle_distal_joint", "right_middle_tip_joint",
+    "right_ring_proximal_joint", "right_ring_distal_joint", "right_ring_tip_joint",
+    "right_pinky_proximal_joint", "right_pinky_distal_joint", "right_pinky_tip_joint"
+]
+body_joint_names = leg_joint_names + arm_joint_names
+
+config = {
+    "cmd_scale": np.array([2.0, 2.0, 0.5], dtype=np.float32),
+    "ang_vel_scale": 0.5,
+    "dof_pos_scale": 1.0,
+    "dof_vel_scale": 0.05,
+    "action_scale": 0.25,
+    "default_angles": np.array([-0.1, 0.0, 0.0, 0.3, -0.2, 0.0,
+                                -0.1, 0.0, 0.0, 0.3, -0.2, 0.0,
+                                 0.0, 0.0, 0.0], dtype=np.float32),
+    "kps": np.array([150, 150, 150, 200, 40, 40,
+                     150, 150, 150, 200, 40, 40,
+                     250.0, 250.0, 250.0], dtype=np.float32),
+    "kds": np.array([2.0, 2.0, 2.0, 4.0, 2.0, 2.0,
+                     2.0, 2.0, 2.0, 4.0, 2.0, 2.0,
+                     5.0, 5.0, 5.0], dtype=np.float32),
+    "height_cmd": 0.74,
+    "rpy_cmd": np.array([0.0, 0.0, 0.0], dtype=np.float32),
+}
+
+arm_kps = np.full(14, 100.0, dtype=np.float32)
+arm_kds = np.full(14, 2.0, dtype=np.float32)
+hand_kps = np.full(32, 50.0, dtype=np.float32)
+hand_kds = np.full(32, 1.0, dtype=np.float32)
+
+
+# ------------------------------------------------------------------------------
+# KEYBOARD TELEOPERATION (PYNPUT)
+# ------------------------------------------------------------------------------
+class KeyboardController:
+    def __init__(self, max_vx=0.8, max_vy=0.4, max_vyaw=0.5, accel=0.5):
+        self.loco_cmd = np.zeros(3, dtype=np.float32)
+        self.target_cmd = np.zeros(3, dtype=np.float32)
+        
+        self.keys_pressed = set()
+        self.special_keys_pressed = set()
+        
+        self.listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
+        self.lock = threading.Lock()
+        self.max_vx = max_vx
+        self.max_vy = max_vy
+        self.max_vyaw = max_vyaw
+        self.accel = accel
+
+    def _on_press(self, key):
+        with self.lock:
+            if hasattr(key, 'char') and key.char is not None:
+                self.keys_pressed.add(key.char.lower())
+            else:
+                self.special_keys_pressed.add(key)
+
+    def _on_release(self, key):
+        with self.lock:
+            if hasattr(key, 'char') and key.char is not None:
+                char_key = key.char.lower()
+                if char_key in self.keys_pressed:
+                    self.keys_pressed.remove(char_key)
+            else:
+                if key in self.special_keys_pressed:
+                    self.special_keys_pressed.remove(key)
+
+    def start(self):
+        self.listener.start()
+        print("\n=== Keyboard Teleop V2 (Pynput) Enabled ===")
+        print("  UP Arrow   : Walk Forward")
+        print("  DOWN Arrow : Walk Backward")
+        print("  LEFT Arrow : Strafe Left")
+        print("  RIGHT Arrow: Strafe Right")
+        print("  Q / E      : Turn Left / Right (Yaw)")
+        print("  ESC / Close: Stop")
+        print("===========================================\n")
+
+    def stop(self):
+        self.listener.stop()
+
+    def update_target_command(self):
+        with self.lock:
+            self.target_cmd.fill(0)
+            
+            # Forward / Backward
+            if keyboard.Key.up in self.special_keys_pressed: 
+                self.target_cmd[0] = self.max_vx
+            if keyboard.Key.down in self.special_keys_pressed: 
+                self.target_cmd[0] = -self.max_vx
+                
+            # Strafe Left / Right
+            if keyboard.Key.left in self.special_keys_pressed: 
+                self.target_cmd[1] = self.max_vy
+            if keyboard.Key.right in self.special_keys_pressed: 
+                self.target_cmd[1] = -self.max_vy
+                
+            # Yaw turn
+            if 'q' in self.keys_pressed: 
+                self.target_cmd[2] = self.max_vyaw
+            if 'e' in self.keys_pressed: 
+                self.target_cmd[2] = -self.max_vyaw
+
+    def get_command(self):
+        self.loco_cmd += self.accel * (self.target_cmd - self.loco_cmd)
+        return self.loco_cmd.copy()
+
+def main():
+    parser = argparse.ArgumentParser(description="Run the Unitree G1 walking policy.")
+    parser.add_argument("--scene", type=str, default=r"D:\NVIDIA\G1_Sim\scenes\mujoco\g1_world_scene.xml")
+    parser.add_argument("--stand_policy", type=str, default=r"D:\NVIDIA\G1_Sim\model_policy\stand.onnx")
+    parser.add_argument("--walk_policy", type=str, default=r"D:\NVIDIA\G1_Sim\model_policy\walk.onnx")
+    parser.add_argument("--control_freq", type=int, default=50, help="Policy execution frequency (Hz)")
+    parser.add_argument("--teleop", action="store_true", help="Enable keyboard teleoperation (Arrow keys + Q/E)")
+    parser.add_argument("--spawn", type=str, choices=["pathway", "house"], default="pathway", help="Where to spawn the robot (pathway or house)")
+    args = parser.parse_args()
+    
+    print(f"Loading Scene: {args.scene}")
+    model = mujoco.MjModel.from_xml_path(args.scene)
+    data = mujoco.MjData(model)
+    
+    # CRITICAL: Match RL Environment Physics Parameters!
+    model.dof_damping[6:] = 0.001
+    model.dof_armature[6:] = 0.01
+    model.dof_frictionloss[6:] = 0.1
+    model.opt.timestep = 0.002
+
+    # Disable all built-in XML actuators (springs/dampers) 
+    # so they don't fight our PD torque controller!
+    if model.nu > 0:
+        model.actuator_gainprm[:] = 0.0
+        model.actuator_biasprm[:] = 0.0
+        model.actuator_gear[:] = 1.0
+    
+    # Try finding joints, ignore hands if not present
+    _, leg_qpos_adrs, leg_dof_adrs = find_joint_info(model, leg_joint_names)
+    _, arm_qpos_adrs, arm_dof_adrs = find_joint_info(model, arm_joint_names)
+    body_qpos_adrs = leg_qpos_adrs + arm_qpos_adrs
+    body_dof_adrs = leg_dof_adrs + arm_dof_adrs
+    
+    try:
+        _, hand_qpos_adrs, hand_dof_adrs = find_joint_info(model, hand_joint_names)
+    except ValueError:
+        print("WARNING: BrainCo hand joints not found. Ignoring hands.")
+        hand_qpos_adrs, hand_dof_adrs = [], []
+        
+    # Load Policies
+    policies = {}
+    use_policy = False
+    try:
+        policies['stand'] = ONNXPolicy(args.stand_policy)
+        policies['walk'] = ONNXPolicy(args.walk_policy)
+        print("Loaded ONNX Policies successfully!")
+        use_policy = True
+    except Exception as e:
+        print(f"Failed to load ONNX policies: {e}")
+        print("Falling back to passive simulation viewer.")
+
+    # Load configuration from config/g1_config.json if it exists
+    config_path = os.path.join(repo_root, 'config', 'g1_config.json')
+    if os.path.exists(config_path):
+        import json
+        try:
+            with open(config_path, 'r') as f:
+                loaded_config = json.load(f)
+            config["cmd_scale"] = np.array(loaded_config["cmd_scale"], dtype=np.float32)
+            config["ang_vel_scale"] = loaded_config["ang_vel_scale"]
+            config["dof_pos_scale"] = loaded_config["dof_pos_scale"]
+            config["dof_vel_scale"] = loaded_config["dof_vel_scale"]
+            config["action_scale"] = loaded_config["action_scale"]
+            config["default_angles"] = np.array(loaded_config["default_angles"], dtype=np.float32)
+            config["kps"] = np.array(loaded_config["kps"], dtype=np.float32)
+            config["kds"] = np.array(loaded_config["kds"], dtype=np.float32)
+            config["height_cmd"] = loaded_config["height_cmd"]
+            config["rpy_cmd"] = np.array(loaded_config["rpy_cmd"], dtype=np.float32)
+            
+            global arm_kps, arm_kds, hand_kps, hand_kds
+            arm_kps = np.full(14, loaded_config["arm_kp"], dtype=np.float32)
+            arm_kds = np.full(14, loaded_config["arm_kd"], dtype=np.float32)
+            hand_kps = np.full(32, loaded_config["hand_kp"], dtype=np.float32)
+            hand_kds = np.full(32, loaded_config["hand_kd"], dtype=np.float32)
+            print("Loaded configuration from config/g1_config.json successfully!")
+        except Exception as e:
+            print(f"Error loading configuration from json, using defaults: {e}")
+
+    # Dynamic joint offset lookup for scenes with other freejoint objects (e.g. Jenga, Apple)
+    robot_j_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "floating_base_joint")
+    if robot_j_id == -1:
+        robot_qpos_adr = 0
+        robot_dof_adr = 0
+    else:
+        robot_qpos_adr = model.jnt_qposadr[robot_j_id]
+        robot_dof_adr = model.jnt_dofadr[robot_j_id]
+
+    # Spawn position adjustments dynamically driven by the scene geometries present
+    spawn_z = 0.74
+    spawn_y = 0.0
+    
+    # Check if concrete pathway exists (spawns on pathway at Z=0.85m)
+    if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "pathway") != -1:
+        spawn_z = 0.85
+        spawn_y = 0.0
+    # Check if house_floor exists and house spawn is requested (spawns in house at Y=9m, Z=0.94m)
+    elif mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "house_floor") != -1 and args.spawn == "house":
+        spawn_z = 0.94
+        spawn_y = 9.0
+
+    # Init Robot Pose
+    data.qpos[robot_qpos_adr + 0] = 0.0
+    data.qpos[robot_qpos_adr + 1] = spawn_y
+    data.qpos[robot_qpos_adr + 2] = spawn_z
+    data.qpos[robot_qpos_adr + 3 : robot_qpos_adr + 7] = [1.0, 0.0, 0.0, 0.0]
+    for idx, qpos_adr in enumerate(leg_qpos_adrs):
+        data.qpos[qpos_adr] = config["default_angles"][idx]
+    mujoco.mj_forward(model, data)
+
+    # Observation History (6 frames of 86 dims = 516 dims)
+    obs_history = collections.deque([np.zeros(86, dtype=np.float32)] * 6, maxlen=6)
+    obs_flat = np.zeros(516, dtype=np.float32)
+    action = np.zeros(15, dtype=np.float32)
+    target_dof_pos = config["default_angles"].copy()
+
+    control_dt = 1.0 / args.control_freq
+    sim_dt = model.opt.timestep
+    steps_per_control = max(1, int(control_dt / sim_dt))
+    
+    controller = None
+    if args.teleop:
+        controller = KeyboardController()
+        controller.start()
+
+    # Teleoperation velocity command
+    loco_cmd = np.zeros(3, dtype=np.float32)
+
+    try:
+        with mujoco.viewer.launch_passive(model, data) as viewer:
+            # Set the camera to track the pelvis body from behind
+            track_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
+            if track_body_id != -1:
+                viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                viewer.cam.trackbodyid = track_body_id
+            
+            viewer.cam.azimuth = 180   # Directly behind
+            viewer.cam.elevation = -25  # Angled down
+            viewer.cam.distance = 2.5   # Comfortable follow distance
+            viewer.cam.lookat = np.array([0.0, 0.0, 0.5])
+
+            step_counter = 0
+            
+            while viewer.is_running() and (not args.teleop or controller.listener.running):
+                step_start = time.time()
+                t = data.time
+                
+                # Update teleop commands dynamically from pynput listener
+                if args.teleop:
+                    controller.update_target_command()
+                    loco_cmd = controller.get_command()
+                else:
+                    if t < 2.0:
+                        loco_cmd = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+                    else:
+                        loco_cmd = np.array([0.8, 0.0, 0.0], dtype=np.float32) # Walk at 0.8 m/s
+                    
+                if use_policy and step_counter % steps_per_control == 0:
+                    # 1. Compute observation vector
+                    command = np.zeros(7, dtype=np.float32)
+                    command[:3] = loco_cmd[:3] * config["cmd_scale"]
+                    command[3] = config["height_cmd"]
+                    command[4:7] = config["rpy_cmd"]
+
+                    quat = data.qpos[robot_qpos_adr + 3 : robot_qpos_adr + 7].copy()
+                    omega_scaled = data.qvel[robot_dof_adr + 3 : robot_dof_adr + 6] * config["ang_vel_scale"]
+                    gravity_orientation = get_gravity_orientation(quat)
+
+                    qj = np.array([data.qpos[adr] for adr in body_qpos_adrs], dtype=np.float32)
+                    dqj = np.array([data.qvel[adr] for adr in body_dof_adrs], dtype=np.float32)
+                    
+                    padded_defaults = np.zeros(29, dtype=np.float32)
+                    padded_defaults[:15] = config["default_angles"]
+                    qj_scaled = (qj - padded_defaults) * config["dof_pos_scale"]
+                    dqj_scaled = dqj * config["dof_vel_scale"]
+
+                    single_obs = np.zeros(86, dtype=np.float32)
+                    single_obs[0:7] = command
+                    single_obs[7:10] = omega_scaled
+                    single_obs[10:13] = gravity_orientation
+                    single_obs[13:42] = qj_scaled
+                    single_obs[42:71] = dqj_scaled
+                    single_obs[71:86] = action
+                    
+                    # 2. Update History
+                    obs_history.append(single_obs)
+                    for idx, hist_obs in enumerate(obs_history):
+                        obs_flat[idx * 86 : (idx + 1) * 86] = hist_obs
+                        
+                    # 3. Policy Execution
+                    is_standing = np.linalg.norm(loco_cmd) <= 0.05
+                    active_policy = policies['stand'] if is_standing else policies['walk']
+                    
+                    action = active_policy.predict(obs_flat)
+                    target_dof_pos = action * config["action_scale"] + config["default_angles"]
+
+                # 4. PD Torque Control (Inject direct torques, don't use internal position control)
+                data.qfrc_applied[:] = 0.0
+                
+                # Legs & Waist (15 DOF, driven by Policy)
+                current_leg_q = np.array([data.qpos[adr] for adr in leg_qpos_adrs], dtype=np.float32)
+                current_leg_dq = np.array([data.qvel[adr] for adr in leg_dof_adrs], dtype=np.float32)
+                leg_torques = pd_control(target_dof_pos, current_leg_q, config["kps"], 0.0, current_leg_dq, config["kds"])
+                
+                for i, dof_adr in enumerate(leg_dof_adrs):
+                    data.qfrc_applied[dof_adr] = leg_torques[i]
+                    
+                # Arms (14 DOF, locked to zero)
+                current_arm_q = np.array([data.qpos[adr] for adr in arm_qpos_adrs], dtype=np.float32)
+                current_arm_dq = np.array([data.qvel[adr] for adr in arm_dof_adrs], dtype=np.float32)
+                arm_torques = pd_control(0.0, current_arm_q, arm_kps, 0.0, current_arm_dq, arm_kds)
+                
+                for i, dof_adr in enumerate(arm_dof_adrs):
+                    data.qfrc_applied[dof_adr] = arm_torques[i]
+                    
+                # Hands (32 DOF, locked to zero)
+                if len(hand_qpos_adrs) > 0:
+                    current_hand_q = np.array([data.qpos[adr] for adr in hand_qpos_adrs], dtype=np.float32)
+                    current_hand_dq = np.array([data.qvel[adr] for adr in hand_dof_adrs], dtype=np.float32)
+                    hand_torques = pd_control(0.0, current_hand_q, hand_kps, 0.0, current_hand_dq, hand_kds)
+                    
+                    for i, dof_adr in enumerate(hand_dof_adrs):
+                        data.qfrc_applied[dof_adr] = hand_torques[i]
+                
+                # Step physics
+                mujoco.mj_step(model, data)
+                
+                # Sync Viewer (~30fps)
+                if step_counter % int(0.033 / sim_dt) == 0:
+                    viewer.sync()
+                    
+                # Maintain realtime
+                time_until_next = sim_dt - (time.time() - step_start)
+                if time_until_next > 0:
+                    time.sleep(time_until_next)
+                    
+                step_counter += 1
+    except Exception as e:
+        print(f"Simulation error: {e}")
+    finally:
+        if args.teleop and controller is not None:
+            controller.stop()
+            print("Teleoperation stopped.")
+
+if __name__ == "__main__":
+    main()
